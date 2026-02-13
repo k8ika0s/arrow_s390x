@@ -72,6 +72,7 @@
 #include "parquet/arrow/test_util.h"
 #include "parquet/arrow/writer.h"
 #include "parquet/column_writer.h"
+#include "parquet/endian_internal.h"
 #include "parquet/file_writer.h"
 #include "parquet/properties.h"
 #include "parquet/test_util.h"
@@ -1312,7 +1313,7 @@ TEST_F(TestInt96ParquetIO, ReadIntoTimestamp) {
 
   // 2nd January 1970, 11:35min 145738543ns
   Int96 day;
-  day.value[2] = UINT32_C(2440589);
+  day.value[2] = ::parquet::internal::ToLittleEndianValue(UINT32_C(2440589));
   int64_t seconds = (11 * 60 + 35) * 60;
   Int96SetNanoSeconds(
       day, seconds * INT64_C(1000) * INT64_C(1000) * INT64_C(1000) + 145738543);
@@ -4146,20 +4147,26 @@ INSTANTIATE_TEST_SUITE_P(Repetition_type, TestNestedSchemaRead,
                          ::testing::Values(Repetition::REQUIRED, Repetition::OPTIONAL));
 
 TEST(TestImpalaConversion, ArrowTimestampToImpalaTimestamp) {
+  auto le32 = [](uint32_t v) { return ::parquet::internal::ToLittleEndianValue(v); };
+
   std::vector<std::pair<int64_t, Int96>> test_cases = {
       // June 20, 2017 16:32:56 and 123456789 nanoseconds
       {INT64_C(1497976376123456789),
-       {{UINT32_C(632093973), UINT32_C(13871), UINT32_C(2457925)}}},
+       {{le32(UINT32_C(632093973)), le32(UINT32_C(13871)), le32(UINT32_C(2457925))}}},
       // January 1, 1970 00:00:00 and 000000000 nanoseconds
-      {INT64_C(0), {{UINT32_C(0), UINT32_C(0), UINT32_C(2440588)}}},
+      {INT64_C(0), {{le32(UINT32_C(0)), le32(UINT32_C(0)), le32(UINT32_C(2440588))}}},
       // December 31, 1969 23:59:59 and 999999000 nanoseconds
-      {INT64_C(-1000), {{UINT32_C(2437872664), UINT32_C(20116), UINT32_C(2440587)}}},
+      {INT64_C(-1000),
+       {{le32(UINT32_C(2437872664)), le32(UINT32_C(20116)), le32(UINT32_C(2440587))}}},
       // December 31, 1969 00:00:00 and 000000000 nanoseconds
-      {INT64_C(-86400000000000), {{UINT32_C(0), UINT32_C(0), UINT32_C(2440587)}}},
+      {INT64_C(-86400000000000),
+       {{le32(UINT32_C(0)), le32(UINT32_C(0)), le32(UINT32_C(2440587))}}},
       // January 1, 1970 00:00:00 and 000001000 nanoseconds
-      {INT64_C(1000), {{UINT32_C(1000), UINT32_C(0), UINT32_C(2440588)}}},
+      {INT64_C(1000),
+       {{le32(UINT32_C(1000)), le32(UINT32_C(0)), le32(UINT32_C(2440588))}}},
       // January 2, 1970 00:00:00 and 000000000 nanoseconds
-      {INT64_C(86400000000000), {{UINT32_C(0), UINT32_C(0), UINT32_C(2440589)}}},
+      {INT64_C(86400000000000),
+       {{le32(UINT32_C(0)), le32(UINT32_C(0)), le32(UINT32_C(2440589))}}},
   };
 
   for (auto& [timestamp, impala_timestamp] : test_cases) {
@@ -4504,7 +4511,8 @@ TEST(TestArrowReaderAdHoc, ReadFloat16Files) {
     ASSERT_TRUE(chunk->IsNull(0));
     for (int32_t i = 0; i < tc.len - 1; ++i) {
       const auto expected = tc.vals[i];
-      const auto actual = Float16::FromBits(chunk->Value(i + 1));
+      const auto actual =
+          Float16::FromBits(::arrow::bit_util::ToLittleEndian(chunk->Value(i + 1)));
       if (expected.is_nan()) {
         // NaN representations aren't guaranteed to be exact on a binary level
         ASSERT_TRUE(actual.is_nan());

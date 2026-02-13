@@ -47,6 +47,7 @@
 #include "parquet/file_writer.h"
 #include "parquet/page_index.h"
 #include "parquet/properties.h"
+#include "parquet/endian_internal.h"
 
 using arrow::Array;
 using arrow::Buffer;
@@ -110,11 +111,13 @@ struct ColumnIndexObject {
 };
 
 auto encode_int64 = [](int64_t value) {
-  return std::string(reinterpret_cast<const char*>(&value), sizeof(int64_t));
+  auto le = ::parquet::internal::ToLittleEndianValue(value);
+  return std::string(reinterpret_cast<const char*>(&le), sizeof(int64_t));
 };
 
 auto encode_double = [](double value) {
-  return std::string(reinterpret_cast<const char*>(&value), sizeof(double));
+  auto le = ::parquet::internal::ToLittleEndianValue(value);
+  return std::string(reinterpret_cast<const char*>(&le), sizeof(double));
 };
 
 }  // namespace

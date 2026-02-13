@@ -18,6 +18,7 @@
 #include "parquet/encoding.h"
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <cstdlib>
 #include <limits>
@@ -45,6 +46,7 @@
 #include "arrow/visit_data_inline.h"
 
 #include "parquet/exception.h"
+#include "parquet/endian_internal.h"
 #include "parquet/platform.h"
 #include "parquet/schema.h"
 #include "parquet/types.h"
@@ -143,6 +145,9 @@ class PlainEncoder : public EncoderImpl, virtual public TypedEncoder<DType> {
   using TypedEncoder<DType>::Put;
 
   void Put(const T* buffer, int num_values) override;
+  void Put(const std::vector<T>& src, int num_values) override {
+    Put(src.data(), num_values);
+  }
 
   void Put(const ::arrow::Array& values) override;
 
@@ -162,7 +167,8 @@ class PlainEncoder : public EncoderImpl, virtual public TypedEncoder<DType> {
 
   void UnsafePutByteArray(const void* data, uint32_t length) {
     DCHECK(length == 0 || data != nullptr) << "Value ptr cannot be NULL";
-    sink_.UnsafeAppend(&length, sizeof(uint32_t));
+    auto le_length = ::parquet::internal::ToLittleEndianValue(length);
+    sink_.UnsafeAppend(&le_length, sizeof(uint32_t));
     sink_.UnsafeAppend(data, static_cast<int64_t>(length));
     unencoded_byte_array_data_bytes_ += length;
   }
@@ -201,7 +207,14 @@ class PlainEncoder : public EncoderImpl, virtual public TypedEncoder<DType> {
 template <typename DType>
 void PlainEncoder<DType>::Put(const T* buffer, int num_values) {
   if (num_values > 0) {
-    PARQUET_THROW_NOT_OK(sink_.Append(buffer, num_values * sizeof(T)));
+    // Always emit canonical little-endian bytes regardless of any build-time shims.
+    ArrowPoolVector<T> scratch(static_cast<size_t>(num_values), T{},
+                               ::arrow::stl::allocator<T>(this->memory_pool()));
+    for (int i = 0; i < num_values; ++i) {
+      scratch[static_cast<size_t>(i)] = ::parquet::internal::ToLittleEndianValue(buffer[i]);
+    }
+    PARQUET_THROW_NOT_OK(
+        sink_.Append(scratch.data(), num_values * static_cast<int64_t>(sizeof(T))));
   }
 }
 
@@ -650,7 +663,10 @@ template <typename DType>
 void DictEncoderImpl<DType>::WriteDict(uint8_t* buffer) const {
   // For primitive types, only a memcpy
   DCHECK_EQ(static_cast<size_t>(dict_encoded_size_), sizeof(T) * memo_table_.size());
-  memo_table_.CopyValues(0 /* start_pos */, reinterpret_cast<T*>(buffer));
+  auto out = reinterpret_cast<T*>(buffer);
+  memo_table_.CopyValues(0 /* start_pos */, out);
+  parquet::internal::ConvertLittleEndianInPlace(
+      out, static_cast<int64_t>(memo_table_.size()));
 }
 
 // ByteArray and FLBA already have the dictionary encoded in their data heaps
@@ -658,8 +674,9 @@ template <>
 void DictEncoderImpl<ByteArrayType>::WriteDict(uint8_t* buffer) const {
   memo_table_.VisitValues(0, [&buffer](::std::string_view v) {
     uint32_t len = static_cast<uint32_t>(v.length());
-    memcpy(buffer, &len, sizeof(len));
-    buffer += sizeof(len);
+    uint32_t len_le = ::parquet::internal::ToLittleEndianValue(len);
+    memcpy(buffer, &len_le, sizeof(len_le));
+    buffer += sizeof(len_le);
     memcpy(buffer, v.data(), len);
     buffer += len;
   });
@@ -923,9 +940,13 @@ class ByteStreamSplitEncoder : public ByteStreamSplitEncoderBase<DType> {
 
   void Put(const T* buffer, int num_values) override {
     if (num_values > 0) {
+      const uint8_t* bytes = reinterpret_cast<const uint8_t*>(buffer);
+      if constexpr (parquet::internal::NeedsEndianConversion<T>::value) {
+        bytes = parquet::internal::PrepareLittleEndianBuffer(buffer, num_values,
+                                                             &little_endian_scratch_);
+      }
       PARQUET_THROW_NOT_OK(
-          this->sink_.Append(reinterpret_cast<const uint8_t*>(buffer),
-                             num_values * static_cast<int64_t>(sizeof(T))));
+          this->sink_.Append(bytes, num_values * static_cast<int64_t>(sizeof(T))));
       this->num_values_in_buffer_ += num_values;
     }
   }
@@ -940,6 +961,9 @@ class ByteStreamSplitEncoder : public ByteStreamSplitEncoderBase<DType> {
                     static_cast<int>(data.length), data.GetValues<uint8_t>(0, 0),
                     data.offset);
   }
+
+ private:
+  std::vector<T> little_endian_scratch_;
 };
 
 // BYTE_STREAM_SPLIT encoder implementation for FLBA
@@ -992,6 +1016,7 @@ class ByteStreamSplitEncoder<FLBAType> : public ByteStreamSplitEncoderBase<FLBAT
       this->num_values_in_buffer_ += num_values;
     }
   }
+
 };
 
 // ----------------------------------------------------------------------
@@ -1091,6 +1116,13 @@ class DeltaBitPackEncoder : public EncoderImpl, virtual public TypedEncoder<DTyp
   void FlushBlock();
 
  private:
+  // DeltaBinaryPacked operates on numeric values; Arrow numeric arrays are
+  // already exposed as native-order values for computation.
+  const T* DecodeArrowValues(const T* values, int num_values) {
+    (void)num_values;
+    return values;
+  }
+
   const uint32_t values_per_block_;
   const uint32_t mini_blocks_per_block_;
   const uint32_t values_per_mini_block_;
@@ -1099,6 +1131,7 @@ class DeltaBitPackEncoder : public EncoderImpl, virtual public TypedEncoder<DTyp
   T first_value_{0};
   T current_value_{0};
   ArrowPoolVector<T> deltas_;
+  ArrowPoolVector<T> arrow_input_scratch_;
   std::shared_ptr<ResizableBuffer> bits_buffer_;
   ::arrow::BufferBuilder sink_;
   ::arrow::bit_util::BitWriter bit_writer_;
@@ -1109,7 +1142,6 @@ void DeltaBitPackEncoder<DType>::Put(const T* src, int num_values) {
   if (num_values == 0) {
     return;
   }
-
   int idx = 0;
   if (total_value_count_ == 0) {
     current_value_ = src[0];
@@ -1140,32 +1172,53 @@ void DeltaBitPackEncoder<DType>::FlushBlock() {
     return;
   }
 
+  const uint32_t values_in_block = values_current_block_;
+
   // Calculate the frame of reference for this miniblock. This value will be subtracted
   // from all deltas to guarantee all deltas are positive for encoding.
   const T min_delta =
       *std::min_element(deltas_.begin(), deltas_.begin() + values_current_block_);
   bit_writer_.PutZigZagVlqInt(min_delta);
 
-  // Call to GetNextBytePtr reserves mini_blocks_per_block_ bytes of space to write
-  // bit widths of miniblocks as they become known during the encoding.
-  uint8_t* bit_width_data = bit_writer_.GetNextBytePtr(mini_blocks_per_block_);
-  DCHECK(bit_width_data != nullptr);
-
   const uint32_t num_miniblocks =
       static_cast<uint32_t>(std::ceil(static_cast<double>(values_current_block_) /
                                       static_cast<double>(values_per_mini_block_)));
+  std::array<uint8_t, kMiniBlocksPerBlock> bit_widths{};
+  std::array<uint32_t, kMiniBlocksPerBlock> mini_value_counts{};
+  uint32_t values_remaining = values_current_block_;
+
+  // First pass: compute bit widths for each miniblock.
   for (uint32_t i = 0; i < num_miniblocks; i++) {
     const uint32_t values_current_mini_block =
-        std::min(values_per_mini_block_, values_current_block_);
-
+        std::min(values_per_mini_block_, values_remaining);
     const uint32_t start = i * values_per_mini_block_;
     const T max_delta = *std::max_element(
         deltas_.begin() + start, deltas_.begin() + start + values_current_mini_block);
 
-    // The minimum number of bits required to write any of values in deltas_ vector.
-    // See overflow comment above.
-    const auto bit_width = bit_width_data[i] = bit_util::NumRequiredBits(
+    const auto bit_width = bit_util::NumRequiredBits(
         static_cast<UT>(max_delta) - static_cast<UT>(min_delta));
+    bit_widths[i] = static_cast<uint8_t>(bit_width);
+    mini_value_counts[i] = values_current_mini_block;
+    values_remaining -= values_current_mini_block;
+  }
+
+  // Zero-fill any unused miniblock slots.
+  for (uint32_t i = num_miniblocks; i < mini_blocks_per_block_; i++) {
+    bit_widths[i] = 0;
+    mini_value_counts[i] = 0;
+  }
+
+  // Write miniblock bit widths.
+  for (uint32_t i = 0; i < mini_blocks_per_block_; ++i) {
+    bit_writer_.PutAligned(bit_widths[i], /*num_bytes=*/1);
+  }
+
+  // Second pass: emit deltas for each miniblock.
+  values_remaining = values_in_block;
+  for (uint32_t i = 0; i < num_miniblocks; i++) {
+    const uint32_t values_current_mini_block = mini_value_counts[i];
+    const uint32_t start = i * values_per_mini_block_;
+    const uint8_t bit_width = bit_widths[i];
 
     for (uint32_t j = start; j < start + values_current_mini_block; j++) {
       // Convert delta to frame of reference. See overflow comment above.
@@ -1178,19 +1231,18 @@ void DeltaBitPackEncoder<DType>::FlushBlock() {
     for (uint32_t j = values_current_mini_block; j < values_per_mini_block_; j++) {
       bit_writer_.PutValue(0, bit_width);
     }
-    values_current_block_ -= values_current_mini_block;
+    values_remaining -= values_current_mini_block;
   }
+  values_current_block_ = 0;
 
   // If, in the last block, less than <number of miniblocks in a block> miniblocks are
   // needed to store the values, the bytes storing the bit widths of the unneeded
   // miniblocks are still present, their value should be zero, but readers must accept
   // arbitrary values as well.
-  for (uint32_t i = num_miniblocks; i < mini_blocks_per_block_; i++) {
-    bit_width_data[i] = 0;
-  }
-  DCHECK_EQ(values_current_block_, 0);
+  DCHECK_EQ(values_remaining, 0);
 
   bit_writer_.Flush();
+
   PARQUET_THROW_NOT_OK(sink_.Append(bit_writer_.buffer(), bit_writer_.bytes_written()));
   bit_writer_.Clear();
 }
@@ -1211,7 +1263,6 @@ std::shared_ptr<Buffer> DeltaBitPackEncoder<DType>::FlushValues() {
     throw ParquetException("header writing error");
   }
   header_writer.Flush();
-
   // We reserved enough space at the beginning of the buffer for largest possible header
   // and data was written immediately after. We now write the header data immediately
   // before the end of reserved space.
@@ -1240,10 +1291,13 @@ void DeltaBitPackEncoder<Int32Type>::Put(const ::arrow::Array& values) {
   }
 
   if (values.null_count() == 0) {
-    Put(data.GetValues<int32_t>(1), static_cast<int>(data.length));
+    const auto* src = DecodeArrowValues(data.GetValues<int32_t>(1),
+                                        static_cast<int>(data.length));
+    Put(src, static_cast<int>(data.length));
   } else {
-    PutSpaced(data.GetValues<int32_t>(1), static_cast<int>(data.length),
-              data.GetValues<uint8_t>(0, 0), data.offset);
+    const auto* src = data.GetValues<int32_t>(1);
+    PutSpaced(src, static_cast<int>(data.length), data.GetValues<uint8_t>(0, 0),
+              data.offset);
   }
 }
 
@@ -1258,10 +1312,13 @@ void DeltaBitPackEncoder<Int64Type>::Put(const ::arrow::Array& values) {
                            std::numeric_limits<int32_t>::max());
   }
   if (values.null_count() == 0) {
-    Put(data.GetValues<int64_t>(1), static_cast<int>(data.length));
+    const auto* src = DecodeArrowValues(data.GetValues<int64_t>(1),
+                                        static_cast<int>(data.length));
+    Put(src, static_cast<int>(data.length));
   } else {
-    PutSpaced(data.GetValues<int64_t>(1), static_cast<int>(data.length),
-              data.GetValues<uint8_t>(0, 0), data.offset);
+    const auto* src = data.GetValues<int64_t>(1);
+    PutSpaced(src, static_cast<int>(data.length), data.GetValues<uint8_t>(0, 0),
+              data.offset);
   }
 }
 
@@ -1275,9 +1332,11 @@ void DeltaBitPackEncoder<DType>::PutSpaced(const T* src, int num_values,
     T* data = buffer->template mutable_data_as<T>();
     int num_valid_values = ::arrow::util::internal::SpacedCompress<T>(
         src, num_values, valid_bits, valid_bits_offset, data);
-    Put(data, num_valid_values);
+    if (num_valid_values > 0) {
+      Put(data, num_valid_values);
+    }
   } else {
-    Put(src, num_values);
+    Put(DecodeArrowValues(src, num_values), num_values);
   }
 }
 

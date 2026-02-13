@@ -48,6 +48,7 @@
 #include "arrow/util/ubsan.h"
 #include "arrow/visit_data_inline.h"
 
+#include "parquet/endian_internal.h"
 #include "parquet/exception.h"
 #include "parquet/platform.h"
 #include "parquet/schema.h"
@@ -439,7 +440,8 @@ int PlainDecoder<DType>::DecodeArrow(
   VisitNullBitmapInline(
       valid_bits, valid_bits_offset, num_values, null_count,
       [&]() {
-        PARQUET_THROW_NOT_OK(builder->Append(SafeLoadAs<value_type>(data)));
+        auto value = ::parquet::internal::LoadLittleEndianScalar<value_type>(data);
+        PARQUET_THROW_NOT_OK(builder->Append(value));
         data += sizeof(value_type);
       },
       [&]() { PARQUET_THROW_NOT_OK(builder->AppendNull()); });
@@ -473,7 +475,7 @@ static inline int64_t ReadByteArray(const uint8_t* data, int64_t data_size,
   if (ARROW_PREDICT_FALSE(data_size < 4)) {
     ParquetException::EofException();
   }
-  const int32_t len = SafeLoadAs<int32_t>(data);
+  const int32_t len = parquet::internal::LoadLittleEndianScalar<int32_t>(data);
   if (len < 0) {
     throw ParquetException("Invalid BYTE_ARRAY value");
   }
@@ -520,10 +522,31 @@ inline int DecodePlain<FixedLenByteArray>(const uint8_t* data, int64_t data_size
 template <typename DType>
 int PlainDecoder<DType>::Decode(T* buffer, int max_values) {
   max_values = std::min(max_values, this->num_values_);
-  int bytes_consumed =
-      DecodePlain<T>(this->data_, this->len_, max_values, this->type_length_, buffer);
-  this->data_ += bytes_consumed;
-  this->len_ -= bytes_consumed;
+  if constexpr (std::is_same_v<T, ByteArray> || std::is_same_v<T, FixedLenByteArray>) {
+    int bytes_consumed =
+        DecodePlain<T>(this->data_, this->len_, max_values, this->type_length_, buffer);
+    this->data_ += bytes_consumed;
+    this->len_ -= bytes_consumed;
+  } else {
+    const int64_t bytes_needed =
+        static_cast<int64_t>(max_values) * static_cast<int64_t>(sizeof(T));
+    if (bytes_needed > this->len_ || bytes_needed < 0) {
+      ParquetException::EofException("PlainDecoder doesn't have enough values in page");
+    }
+
+    if constexpr (parquet::internal::NeedsEndianConversion<T>::value) {
+      const uint8_t* data = this->data_;
+      for (int i = 0; i < max_values; ++i) {
+        buffer[i] = parquet::internal::LoadLittleEndianScalar<T>(
+            data + static_cast<int64_t>(i) * static_cast<int64_t>(sizeof(T)));
+      }
+    } else {
+      memcpy(buffer, this->data_, static_cast<size_t>(bytes_needed));
+    }
+
+    this->data_ += bytes_needed;
+    this->len_ -= bytes_needed;
+  }
   this->num_values_ -= max_values;
   return max_values;
 }
@@ -775,7 +798,7 @@ class PlainByteArrayDecoder : public PlainDecoder<ByteArrayType> {
             //   2. the running `value_len > estimated_data_length` check below.
             // This precondition follows from those two checks.
             DCHECK_GE(len_, 4);
-            auto value_len = SafeLoadAs<int32_t>(data_);
+            auto value_len = parquet::internal::LoadLittleEndianScalar<int32_t>(data_);
             // This check also ensures that `value_len <= len_ - 4` due to the way
             // `estimated_data_length` is computed.
             if (ARROW_PREDICT_FALSE(value_len < 0 || value_len > estimated_data_length)) {
@@ -826,7 +849,7 @@ class PlainByteArrayDecoder : public PlainDecoder<ByteArrayType> {
                 return Status::Invalid(
                     "Invalid or truncated PLAIN-encoded BYTE_ARRAY data");
               }
-              auto value_len = SafeLoadAs<int32_t>(data_);
+              auto value_len = parquet::internal::LoadLittleEndianScalar<int32_t>(data_);
               if (ARROW_PREDICT_FALSE(value_len < 0 || value_len > len_ - 4)) {
                 return Status::Invalid(
                     "Invalid or truncated PLAIN-encoded BYTE_ARRAY data");
@@ -2243,6 +2266,11 @@ class ByteStreamSplitDecoderBase : public TypedDecoderImpl<DType> {
     const int num_decoded = this->DecodeRaw(decode_out, values_to_decode);
     DCHECK_EQ(num_decoded, values_to_decode);
 
+    if constexpr (parquet::internal::NeedsEndianConversion<T>::value) {
+      parquet::internal::ConvertLittleEndianInPlace(
+          reinterpret_cast<T*>(decode_out), num_decoded);
+    }
+
     if (null_count == 0) {
       // No expansion required, and no need to append the bitmap
       builder->UnsafeAdvance(num_values);
@@ -2292,7 +2320,11 @@ class ByteStreamSplitDecoder : public ByteStreamSplitDecoderBase<DType> {
   using Base::Base;
 
   int Decode(T* buffer, int max_values) override {
-    return this->DecodeRaw(reinterpret_cast<uint8_t*>(buffer), max_values);
+    int decoded = this->DecodeRaw(reinterpret_cast<uint8_t*>(buffer), max_values);
+    if constexpr (parquet::internal::NeedsEndianConversion<T>::value) {
+      parquet::internal::ConvertLittleEndianInPlace(buffer, decoded);
+    }
+    return decoded;
   }
 };
 

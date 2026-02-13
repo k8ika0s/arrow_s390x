@@ -21,6 +21,10 @@ add_custom_target(parquet-benchmarks)
 add_custom_target(parquet-tests)
 add_dependencies(parquet-all parquet parquet-tests parquet-benchmarks)
 
+if(ARROW_ENSURE_S390X_ENDIANNESS)
+  add_definitions(-DARROW_ENSURE_S390X_ENDIANNESS)
+endif()
+
 # If libparquet.a is only built, "pkg-config --cflags --libs parquet"
 # outputs build flags for static linking not shared
 # linking. PARQUET_PC_* except PARQUET_PC_*_PRIVATE are for the static
