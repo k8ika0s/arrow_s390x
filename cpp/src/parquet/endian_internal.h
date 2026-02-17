@@ -30,20 +30,8 @@ namespace parquet {
 namespace internal {
 
 inline uint16_t bswap16(uint16_t x) { return static_cast<uint16_t>((x << 8) | (x >> 8)); }
-inline uint32_t bswap32(uint32_t x) {
-  return ((x & 0x000000FFu) << 24) | ((x & 0x0000FF00u) << 8) |
-         ((x & 0x00FF0000u) >> 8) | ((x & 0xFF000000u) >> 24);
-}
-inline uint64_t bswap64(uint64_t x) {
-  return ((x & 0x00000000000000FFull) << 56) |
-         ((x & 0x000000000000FF00ull) << 40) |
-         ((x & 0x0000000000FF0000ull) << 24) |
-         ((x & 0x00000000FF000000ull) << 8) |
-         ((x & 0x000000FF00000000ull) >> 8) |
-         ((x & 0x0000FF0000000000ull) >> 24) |
-         ((x & 0x00FF000000000000ull) >> 40) |
-         ((x & 0xFF00000000000000ull) >> 56);
-}
+inline uint32_t bswap32(uint32_t x) { return ::arrow::bit_util::ByteSwap(x); }
+inline uint64_t bswap64(uint64_t x) { return ::arrow::bit_util::ByteSwap(x); }
 
 template <typename T, typename Enable = void>
 struct ByteSwap;
